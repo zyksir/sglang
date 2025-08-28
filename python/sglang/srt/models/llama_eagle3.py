@@ -183,8 +183,6 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
         self.model = LlamaModel(
             config, quant_config=quant_config, prefix=add_prefix("model", prefix)
         )
-        # Llama 3.2 1B Instruct set tie_word_embeddings to True
-        # Llama 3.1 8B Instruct set tie_word_embeddings to False
         if self.config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
         else:
