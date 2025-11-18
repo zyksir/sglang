@@ -141,6 +141,8 @@ class LlamaModel(nn.Module):
         self.midlayer = LlamaDecoderLayer(config, 0, quant_config, prefix)
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.time_embedding_weight = None
+        self.time_embedding_bias = None
 
     def forward(
         self,
@@ -175,9 +177,17 @@ class LlamaModel(nn.Module):
             residual,
         )
 
-        hidden_states_to_logits, hidden_states_to_aux = self.norm(
-            hidden_states, residual
-        )
+        hidden_states = hidden_states + residual
+        if self.time_embedding_weight is not None:
+            t = forward_batch.spec_info.eagle4_time_step
+            time_embedding_weight = self.time_embedding_weight[t].view(1, -1)
+            time_embedding_bias = self.time_embedding_bias[t].view(1, -1)
+            hidden_states = (
+                hidden_states * (1 + time_embedding_weight) + time_embedding_bias
+            )
+
+        hidden_states_to_aux = hidden_states
+        hidden_states_to_logits = self.norm(hidden_states)
 
         # For draft decode, we capture the hidden state before norm
         return hidden_states_to_logits, [hidden_states_to_aux]
@@ -225,6 +235,23 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
 
         self.capture_aux_hidden_states = True
         self.hot_token_id = None
+        self.sinusoid = None
+        self.modulation = None
+        self.time_embedding = None
+        if (
+            hasattr(config, "time_embedding_freq_dim")
+            and config.time_embedding_freq_dim is not None
+        ):
+            print(
+                f"Loading time embedding with freq dim {config.time_embedding_freq_dim}"
+            )
+            self.time_embedding = nn.Sequential(
+                nn.Linear(
+                    config.time_embedding_freq_dim, config.hidden_size, bias=False
+                ),
+                nn.SiLU(),
+                nn.Linear(config.hidden_size, config.hidden_size, bias=False),
+            )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
         params_dict = dict(self.named_parameters())
@@ -239,6 +266,14 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
         ]
 
         for name, loaded_weight in weights:
+            if "modulation" in name:
+                self.modulation = loaded_weight
+                print(f"Loading modulation to {self.modulation.shape}")
+                continue
+            if "sinusoid" in name:
+                self.sinusoid = loaded_weight
+                print(f"Loading sinusoid to {self.sinusoid.shape}")
+                continue
             if "d2t" in name:
                 # d2t stores diffs between draft id and target id
                 self.hot_token_id = loaded_weight + torch.arange(loaded_weight.shape[0])
@@ -267,7 +302,34 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
                     )
+                    print(f"Loading {name} to {param_name}")
                     weight_loader(param, loaded_weight)
+
+        if self.sinusoid is not None:
+            print(
+                f"Loading {self.sinusoid.device=},{self.time_embedding[0].weight.dtype=},{self.time_embedding[0].weight.device=},{self.modulation.dtype=},{self.modulation.device=}"
+            )
+            self.sinusoid = self.sinusoid.to(self.time_embedding[0].weight.dtype).to(
+                self.time_embedding[0].weight.device
+            )
+            self.modulation = self.modulation.to(
+                self.time_embedding[0].weight.dtype
+            ).to(self.time_embedding[0].weight.device)
+            sinusoid = self.time_embedding(
+                self.sinusoid.to(self.time_embedding[0].weight.dtype).to(
+                    self.time_embedding[0].weight.device
+                )
+            )
+            time_embedding_weight, time_embedding_bias = self.modulation.chunk(2, dim=1)
+            self.model.time_embedding_weight = time_embedding_weight.view(
+                1, -1
+            ) + sinusoid.view(8, -1)
+            self.model.time_embedding_bias = time_embedding_bias.view(
+                1, -1
+            ) + sinusoid.view(8, -1)
+            print(
+                f"Loading sinusoid to {self.model.time_embedding_weight.shape=}, {self.model.time_embedding_bias.shape=}"
+            )
 
     def get_hot_token_id(self):
         return self.hot_token_id

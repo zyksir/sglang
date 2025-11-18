@@ -622,6 +622,7 @@ class EAGLEWorker(TpModelWorker):
             forward_batch.positions.add_(1)
             forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
             spec_info.hidden_states = hidden_states
+            spec_info.eagle4_time_step = i + 1
 
             # Run forward
             logits_output, _ = self.draft_model_runner.forward(
@@ -867,6 +868,7 @@ class EAGLEWorker(TpModelWorker):
             num_tokens_for_logprob_per_batch=1,
         )
         batch.return_hidden_states = False
+        batch.spec_info.eagle4_time_step = 0
         batch.spec_info.prepare_for_extend(batch)
         batch.spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
         model_worker_batch = batch.get_model_worker_batch(
@@ -927,6 +929,7 @@ class EAGLEWorker(TpModelWorker):
 
         batch.spec_info.num_tokens_per_batch = self.speculative_num_steps + 1
         batch.spec_info.num_tokens_for_logprob_per_batch = 1
+        batch.spec_info.eagle4_time_step = 0
         batch.spec_info.prepare_extend_after_decode(
             batch,
             self.speculative_num_steps,

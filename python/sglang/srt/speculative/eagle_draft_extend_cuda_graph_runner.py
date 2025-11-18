@@ -281,6 +281,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             accept_length=accept_length,
         )
         spec_info.positions = None
+        spec_info.eagle4_time_step = 0
 
         self.deepep_adapter.capture(is_extend_in_batch=True)
 
