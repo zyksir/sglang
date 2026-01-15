@@ -8,6 +8,9 @@ import triton.testing
 from sgl_kernel import rmsnorm
 
 from sglang.jit_kernel.norm import fused_inplace_qknorm
+from sglang.multimodal_gen.runtime.layers.triton_ops import (
+    fused_scale_shift_residual_layernorm,
+)
 from sglang.srt.utils import get_current_device_stream_fast
 
 IS_CI = (
@@ -26,8 +29,8 @@ def sglang_aot_qknorm(
 ) -> None:
 
     head_dim = q.shape[-1]
-    q = q.view(-1, head_dim)
-    k = k.view(-1, head_dim)
+    q = q.reshape(-1, head_dim)
+    k = k.reshape(-1, head_dim)
 
     current_stream = get_current_device_stream_fast()
     alt_stream.wait_stream(current_stream)
@@ -75,6 +78,17 @@ def torch_impl_qknorm(
     k.copy_(k.float() * k_norm * k_weight.float())
 
 
+def sglang_triton_qknorm(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    eps: float = 1e-6,
+) -> None:
+    fused_scale_shift_residual_layernorm(q, eps=eps, weight=q_weight, out=q)
+    fused_scale_shift_residual_layernorm(k, eps=eps, weight=k_weight, out=k)
+
+
 HEAD_DIM = 128
 DTYPE = torch.bfloat16
 DEVICE = "cuda"
@@ -84,13 +98,25 @@ if IS_CI:
     GQA_RANGE = [4]
     KV_HEAD_RANGE = [1]
 else:
-    BS_RANGE = [2**n for n in range(0, 14)]
-    GQA_RANGE = [4, 8]
-    KV_HEAD_RANGE = [1, 2, 4, 8]
+    BS_RANGE = [2**n for n in range(10, 14)]
+    GQA_RANGE = [1]
+    KV_HEAD_RANGE = [24, 48]
 
-LINE_VALS = ["aot", "jit", "fi", "torch"]
-LINE_NAMES = ["SGL AOT Kernel", "SGL JIT Kernel", "FlashInfer", "PyTorch"]
-STYLES = [("orange", "-"), ("blue", "--"), ("green", "-."), ("red", ":")]
+LINE_VALS = ["aot", "jit", "fi", "torch", "triton"]
+LINE_NAMES = [
+    "SGL AOT Kernel",
+    "SGL JIT Kernel",
+    "FlashInfer",
+    "PyTorch",
+    "SGL Triton Kernel",
+]
+STYLES = [
+    ("orange", "-"),
+    ("blue", "--"),
+    ("green", "-."),
+    ("red", ":"),
+    ("purple", "-."),
+]
 
 configs = list(itertools.product(GQA_RANGE, KV_HEAD_RANGE, BS_RANGE))
 
@@ -121,6 +147,7 @@ def benchmark(
         "jit": sglang_jit_qknorm,
         "fi": flashinfer_qknorm,
         "torch": torch_impl_qknorm,
+        "triton": sglang_triton_qknorm,
     }
     fn = lambda: FN_MAP[provider](q, k, q_weight, k_weight)
     quantiles = [0.5, 0.2, 0.8]

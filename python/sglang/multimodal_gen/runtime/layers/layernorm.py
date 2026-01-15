@@ -19,8 +19,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 from sglang.multimodal_gen.runtime.layers.custom_op import CustomOp
 from sglang.multimodal_gen.runtime.layers.triton_ops import (
     fuse_scale_shift_kernel,
-    norm_infer,
-    rms_norm_fn,
+    fused_scale_shift_residual_layernorm,
 )
 from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 
@@ -51,15 +50,32 @@ class RMSNorm(CustomOp):
         if get_bool_env_var("SGLANG_ENABLE_DETERMINISTIC_INFERENCE"):
             self._forward_method = self.forward_native
 
-    def forward_triton(self, x: torch.Tensor, residual: Optional[torch.Tensor] = None):
-        return rms_norm_fn(
-            x, self.weight, bias=None, residual=residual, eps=self.variance_epsilon
+    def forward_triton(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        residual_out: Optional[torch.Tensor] = None,
+        scale: Optional[torch.Tensor] = None,
+        shift: Optional[torch.Tensor] = None,
+    ):
+        return fused_scale_shift_residual_layernorm(
+            x,
+            weight=self.weight,
+            bias=None,
+            eps=self.variance_epsilon,
+            residual=residual,
+            residual_out=residual_out,
+            out_scale=scale,
+            out_shift=shift,
+            is_rms_norm=True,
         )
 
     def forward_cuda(
         self,
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
+        scale: Optional[torch.Tensor] = None,
+        shift: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         shape = x.shape
         x = x.reshape(-1, shape[-1])
@@ -67,11 +83,14 @@ class RMSNorm(CustomOp):
             residual_shape = residual.shape
             residual = residual.view(-1, shape[-1])
 
-        if x.dtype == torch.float:
+        if x.dtype == torch.float or scale is not None or shift is not None:
             # fp32
-            out = self.forward_triton(x, residual)
+            residual_out = torch.empty_like(residual) if residual is not None else None
+            out = self.forward_triton(x, residual, residual_out, scale, shift)
+            if residual is not None:
+                return out.view(shape), residual_out.view(residual_shape)
         elif self.variance_size_override is not None:
-            return self.forward_native(x, residual)
+            return self.forward_native(x, residual, scale, shift)
         elif residual is not None:
             fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
             return x.view(shape), residual.view(residual_shape)
@@ -84,6 +103,8 @@ class RMSNorm(CustomOp):
         self,
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
+        scale: Optional[torch.Tensor] = None,
+        shift: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if not x.is_contiguous():
             x = x.contiguous()
@@ -114,6 +135,10 @@ class RMSNorm(CustomOp):
         variance = x_var.pow(2).mean(dim=-1, keepdim=True)
         x = x * torch.rsqrt(variance + self.variance_epsilon)
         x = (x * self.weight).to(orig_dtype)
+        if scale is not None:
+            x = x * scale
+        if shift is not None:
+            x = x + shift
         if residual is None:
             return x
         else:
@@ -123,16 +148,20 @@ class RMSNorm(CustomOp):
         self,
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
+        scale: Optional[torch.Tensor] = None,
+        shift: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        return self.forward_native(x, residual)
+        return self.forward_native(x, residual, scale, shift)
 
     def forward_hip(
         self,
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
+        scale: Optional[torch.Tensor] = None,
+        shift: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         # ROCm builds of sgl-kernel do not expose rmsnorm custom ops yet.
-        return self.forward_native(x, residual)
+        return self.forward_native(x, residual, scale, shift)
 
     def extra_repr(self) -> str:
         s = f"hidden_size={self.weight.data.size(0)}"
@@ -183,13 +212,14 @@ class LayerNorm(CustomOp):
 
     def forward_triton(self, x: torch.Tensor):
         # Fast inference kernel without residual/dropout branches
-        return norm_infer(
+        out, _ = fused_scale_shift_residual_layernorm(
             x.view(-1, self.hidden_size),
-            self.weight,
-            self.bias,
+            weight=self.weight,
+            bias=self.bias,
             eps=self.eps,
             is_rms_norm=False,
-        ).view(x.shape)
+        )
+        return out.view(x.shape)
 
     def forward_cuda(
         self,
@@ -204,6 +234,8 @@ class LayerNorm(CustomOp):
         self,
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
+        scale: Optional[torch.Tensor] = None,
+        shift: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         input_dtype = x.dtype
         mean = x.mean(-1, keepdim=True)
@@ -214,18 +246,24 @@ class LayerNorm(CustomOp):
         # if no affine, this is a no-op
         if self.bias is not None:
             x = x + self.bias
+        if scale is not None:
+            x = x * scale
+        if shift is not None:
+            x = x + shift
         return x.to(input_dtype)
 
     def forward_cpu(
         self,
         x: torch.Tensor,
         residual: Optional[torch.Tensor] = None,
+        scale: Optional[torch.Tensor] = None,
+        shift: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        return self.forward_native(x, residual)
+        return self.forward_native(x, residual, scale, shift)
 
     def extra_repr(self) -> str:
         s = f"hidden_size={self.weight.data.size(0)}"
-        s += f", eps={self.variance_epsilon}"
+        s += f", eps={self.eps}"
         return s
 
 

@@ -8,6 +8,9 @@ from flashinfer import rmsnorm as fi_rmsnorm
 from sgl_kernel import rmsnorm
 
 from sglang.jit_kernel.norm import rmsnorm as jit_rmsnorm
+from sglang.multimodal_gen.runtime.layers.triton_ops import (
+    fused_scale_shift_residual_layernorm,
+)
 
 IS_CI = (
     os.getenv("CI", "false").lower() == "true"
@@ -47,6 +50,14 @@ def torch_impl_rmsnorm(
     input.copy_(input.float() * norm * weight.float())
 
 
+def sglang_triton_rmsnorm(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+) -> None:
+    fused_scale_shift_residual_layernorm(input, eps=eps, weight=weight, out=input)
+
+
 DTYPE = torch.bfloat16
 DEVICE = "cuda"
 
@@ -57,9 +68,21 @@ else:
     BS_LIST = [2**n for n in range(0, 14)]
     HIDDEN_SIZE_LIST = [1536, 3072, 4096, 5120, 8192]
 
-LINE_VALS = ["aot", "jit", "fi", "torch"]
-LINE_NAMES = ["SGL AOT Kernel", "SGL JIT Kernel", "FlashInfer", "PyTorch"]
-STYLES = [("orange", "-"), ("blue", "--"), ("green", "-."), ("red", ":")]
+LINE_VALS = ["aot", "jit", "fi", "torch", "triton"]
+LINE_NAMES = [
+    "SGL AOT Kernel",
+    "SGL JIT Kernel",
+    "FlashInfer",
+    "PyTorch",
+    "SGL Triton Kernel",
+]
+STYLES = [
+    ("orange", "-"),
+    ("blue", "--"),
+    ("green", "-."),
+    ("red", ":"),
+    ("purple", "-."),
+]
 
 configs = list(itertools.product(HIDDEN_SIZE_LIST, BS_LIST))
 
@@ -85,6 +108,7 @@ def benchmark(hidden_size: int, batch_size: int, provider: str):
         "jit": sglang_jit_rmsnorm,
         "fi": flashinfer_rmsnorm,
         "torch": torch_impl_rmsnorm,
+        "triton": sglang_triton_rmsnorm,
     }
     fn = lambda: FN_MAP[provider](input.clone(), weight)
     quantiles = [0.5, 0.2, 0.8]

@@ -1,6 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # TODO: for temporary usage, expecting a refactor
+import warnings
 from typing import Optional
 
 import torch
@@ -1106,3 +1107,406 @@ def rms_norm_fn(
         out,
         residual_out,
     )
+
+
+@triton.autotune(
+    configs=triton_autotune_configs(),
+    key=[
+        "N",
+        "IS_RMS_NORM",
+        "HAS_BIAS",
+        "HAS_RESIDUAL",
+        "HAS_RESIDUAL_OUT",
+        "HAS_SCALE",
+        "HAS_SHIFT",
+    ],
+)
+@triton.jit
+def _fused_scale_shift_residual_layernorm_1pass_1row_kernel(
+    X,  # pointer to the input
+    Y,  # pointer to the output
+    W,  # pointer to the weights
+    B,  # pointer to the bias
+    RESIDUAL,  # pointer to the residual
+    RESIDUAL_OUT,  # pointer to the residual output
+    SCALE,  # pointer to the output scale
+    SHIFT,  # pointer to the output shift
+    stride_x_row: tl.int64,  # how much to increase the pointer when moving by 1 block
+    stride_y_row: tl.int64,  # how much to increase the pointer when moving by 1 block
+    stride_res_row: tl.int64,  # how much to increase the pointer when moving by 1 block
+    stride_res_out_row: tl.int64,  # how much to increase the pointer when moving by 1 block
+    stride_scale_row: tl.int64,  # how much to increase the pointer when moving by 1 block
+    stride_shift_row: tl.int64,  # how much to increase the pointer when moving by 1 block
+    N: tl.int64,  # number of columns in X
+    eps: tl.constexpr,  # epsilon to avoid division by zero
+    BLOCK_SIZE_N: tl.constexpr,
+    IS_RMS_NORM: tl.constexpr,
+    HAS_WEIGHT: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    HAS_RESIDUAL: tl.constexpr,
+    HAS_RESIDUAL_OUT: tl.constexpr,
+    HAS_SCALE: tl.constexpr,
+    HAS_SHIFT: tl.constexpr,
+):
+    row = tl.program_id(0)
+    X += row * stride_x_row
+    Y += row * stride_y_row
+    cols = tl.arange(0, BLOCK_SIZE_N)
+    mask = cols < N
+    x = tl.load(X + cols, mask=mask, other=0.0).to(tl.float32)
+    if HAS_RESIDUAL:
+        RESIDUAL += row * stride_res_row
+        residual = tl.load(RESIDUAL + cols, mask=mask, other=0.0).to(tl.float32)
+        x += residual
+        if HAS_RESIDUAL_OUT:
+            RESIDUAL_OUT += row * stride_res_out_row
+            tl.store(RESIDUAL_OUT + cols, x, mask=mask)
+    if IS_RMS_NORM:
+        xbar = tl.where(mask, x, 0.0)
+        var = tl.sum(xbar * xbar, axis=0) / N
+    else:
+        mean = tl.sum(x, axis=0) / N
+        xbar = tl.where(mask, x - mean, 0.0)
+        var = tl.sum(xbar * xbar, axis=0) / N
+    rstd = 1 / tl.sqrt(var + eps)
+    y = x * rstd if IS_RMS_NORM else (x - mean) * rstd
+    if HAS_WEIGHT:
+        w = tl.load(W + cols, mask=mask, other=0.0).to(tl.float32)
+        y = y * w
+    if HAS_BIAS:
+        b = tl.load(B + cols, mask=mask, other=0.0).to(tl.float32)
+        y = y + b
+    if HAS_SCALE:
+        SCALE += row * stride_scale_row
+        scale = tl.load(SCALE + cols, mask=mask, other=0.0).to(tl.float32)
+        y *= scale
+    if HAS_SHIFT:
+        SHIFT += row * stride_shift_row
+        shift = tl.load(SHIFT + cols, mask=mask, other=0.0).to(tl.float32)
+        y += shift
+    tl.store(Y + cols, y, mask=mask)
+
+
+@triton.autotune(
+    configs=triton_autotune_configs(),
+    key=[
+        "N",
+        "IS_RMS_NORM",
+        "HAS_WEIGHT",
+        "HAS_BIAS",
+        "HAS_RESIDUAL",
+        "HAS_RESIDUAL_OUT",
+        "HAS_SCALE",
+        "HAS_SHIFT",
+    ],
+)
+@triton.jit
+def _fused_scale_shift_residual_layernorm_1pass_multirow_kernel(
+    X,  # pointer to the input
+    Y,  # pointer to the output
+    W,  # pointer to the weights
+    B,  # pointer to the bias
+    RESIDUAL,  # pointer to the residual
+    RESIDUAL_OUT,  # pointer to the residual output
+    SCALE,  # pointer to the output scale
+    SHIFT,  # pointer to the output shift
+    stride_x_row: tl.int64,  # how much to increase the pointer when moving by 1 block
+    stride_y_row: tl.int64,  # how much to increase the pointer when moving by 1 block
+    stride_res_row: tl.int64,  # how much to increase the pointer when moving by 1 block
+    stride_res_out_row: tl.int64,  # how much to increase the pointer when moving by 1 block
+    stride_scale_row: tl.int64,  # how much to increase the pointer when moving by 1 block
+    stride_shift_row: tl.int64,  # how much to increase the pointer when moving by 1 block
+    M: tl.int64,  # number of rows in X
+    N: tl.int64,  # number of columns in X
+    eps: tl.constexpr,  # epsilon to avoid division by zero
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    IS_RMS_NORM: tl.constexpr,
+    HAS_WEIGHT: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    HAS_RESIDUAL: tl.constexpr,
+    HAS_RESIDUAL_OUT: tl.constexpr,
+    HAS_SCALE: tl.constexpr,
+    HAS_SHIFT: tl.constexpr,
+):
+    row_offset = tl.program_id(0) * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    row_mask = row_offset < M
+    col_offset = tl.arange(0, BLOCK_SIZE_N)
+    col_mask = col_offset < N
+    mask = row_mask[:, None] & col_mask[None, :]
+    x_ptrs = (
+        X + row_offset[:, None] * stride_x_row + tl.arange(0, BLOCK_SIZE_N)[None, :]
+    )
+    y_ptrs = (
+        Y + row_offset[:, None] * stride_y_row + tl.arange(0, BLOCK_SIZE_N)[None, :]
+    )
+    x = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
+    if HAS_RESIDUAL:
+        residual_ptrs = (
+            RESIDUAL
+            + row_offset[:, None] * stride_res_row
+            + tl.arange(0, BLOCK_SIZE_N)[None, :]
+        )
+        residual = tl.load(residual_ptrs, mask=mask, other=0.0).to(tl.float32)
+        x += residual
+        if HAS_RESIDUAL_OUT:
+            residual_out_ptrs = (
+                RESIDUAL_OUT
+                + row_offset[:, None] * stride_res_out_row
+                + tl.arange(0, BLOCK_SIZE_N)[None, :]
+            )
+            tl.store(residual_out_ptrs, x, mask=mask)
+    if IS_RMS_NORM:
+        xbar = tl.where(mask, x, 0.0)
+        var = tl.sum(xbar * xbar, axis=1) / N
+    else:
+        mean = (tl.sum(x, axis=1) / N).reshape(BLOCK_SIZE_M, 1)
+        xbar = tl.where(mask, x - mean, 0.0)
+        var = tl.sum(xbar * xbar, axis=1) / N
+    rstd = 1 / tl.sqrt(var + eps).reshape(BLOCK_SIZE_M, 1)
+    y = x * rstd if IS_RMS_NORM else (x - mean) * rstd
+    if HAS_WEIGHT:
+        w = tl.load(W + col_offset, mask=col_mask, other=0.0).to(tl.float32)
+        y = y * w
+    if HAS_BIAS:
+        b = tl.load(B + col_offset, mask=col_mask, other=0.0).to(tl.float32)
+        y = y + b
+    if HAS_SCALE:
+        scale_ptrs = (
+            SCALE
+            + row_offset[:, None] * stride_scale_row
+            + tl.arange(0, BLOCK_SIZE_N)[None, :]
+        )
+        scale = tl.load(scale_ptrs, mask=mask, other=0.0).to(tl.float32)
+        y *= scale
+    if HAS_SHIFT:
+        shift_ptrs = (
+            SHIFT
+            + row_offset[:, None] * stride_shift_row
+            + tl.arange(0, BLOCK_SIZE_N)[None, :]
+        )
+        shift = tl.load(shift_ptrs, mask=mask, other=0.0).to(tl.float32)
+        y += shift
+    tl.store(y_ptrs, y, mask=mask)
+
+
+@triton.autotune(
+    configs=triton_autotune_configs(),
+    key=["N", "IS_RMS_NORM", "HAS_BIAS"],
+)
+@triton.jit
+def _qk_norm_kernel(
+    X,  # pointer to the input
+    Y,  # pointer to the output
+    W,  # pointer to the weights
+    B,  # pointer to the bias
+    stride_x_row: tl.int64,
+    stride_y_row: tl.int64,
+    M: tl.int64,
+    N: tl.constexpr,
+    eps: tl.constexpr,  # epsilon to avoid division by zero
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    IS_RMS_NORM: tl.constexpr,
+    HAS_WEIGHT: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+):
+    row = tl.program_id(0)
+    X += row * stride_x_row
+    Y += row * stride_y_row
+    m_offset = tl.arange(0, BLOCK_SIZE_M)
+    n_offset = tl.arange(0, BLOCK_SIZE_N)
+    m_mask = m_offset < M
+    n_mask = n_offset < N
+    x_mask = m_mask[:, None] & n_mask[None, :]
+    x = tl.load(
+        X + m_offset[:, None] * N + n_offset[None, :], mask=x_mask, other=0.0
+    ).to(tl.float32)
+    if IS_RMS_NORM:
+        xbar = tl.where(x_mask, x, 0.0)
+        var = tl.sum(xbar * xbar, axis=1) / N
+    else:
+        mean = (tl.sum(x, axis=1) / N).reshape(BLOCK_SIZE_M, 1)
+        xbar = tl.where(x_mask, x - mean, 0.0)
+        var = tl.sum(xbar * xbar, axis=1) / N
+    rstd = 1 / tl.sqrt(var + eps).reshape(BLOCK_SIZE_M, 1)
+    y = x * rstd if IS_RMS_NORM else (x - mean) * rstd
+    if HAS_WEIGHT:
+        w = tl.load(W + n_offset, mask=n_mask, other=0.0).to(tl.float32)
+        y = y * w[None, :]
+    if HAS_BIAS:
+        b = tl.load(B + n_offset, mask=n_mask, other=0.0).to(tl.float32)
+        y = y + b[None, :]
+    tl.store(Y + m_offset[:, None] * N + n_offset[None, :], y, mask=x_mask)
+
+
+def _fused_scale_shift_residual_layernorm(
+    x: Tensor,  # [M, N]
+    out: Tensor,  # [M, N]
+    eps: float = 1e-5,
+    weight: Optional[Tensor] = None,  # [N]
+    bias: Optional[Tensor] = None,  # [N]
+    residual: Optional[Tensor] = None,  # [M, N]
+    residual_out: Optional[Tensor] = None,  # [M, N]
+    scale: Optional[Tensor] = None,  # [M, N]
+    shift: Optional[Tensor] = None,  # [M, N]
+    is_rms_norm: bool = True,
+):
+    assert x.is_contiguous(), "x must be contiguous"
+    assert x.dim() == 2, "x must be a 2D tensor"
+    M, N = x.shape
+    assert (
+        N * x.element_size() < 65536
+    ), f"dim size must be less than 64KB, got {N * x.element_size()} bytes"
+    assert out.shape == x.shape, f"{out.shape=} != {x.shape=}"
+    assert weight is None or weight.shape == (N,), f"{weight.shape=} != {N=}"
+    assert bias is None or bias.shape == (N,), f"{bias.shape=} != {N=}"
+    assert (
+        residual is None or residual.shape == x.shape
+    ), f"{residual.shape=} != {x.shape=}"
+    assert scale is None or scale.shape == x.shape, f"{scale.shape=} != {x.shape=}"
+    assert shift is None or shift.shape == x.shape, f"{shift.shape=} != {x.shape=}"
+    MIN_BLOCK_SIZE = 1024  # MAGIC NUMBER
+    if N < MIN_BLOCK_SIZE:
+        BLOCK_SIZE_N = triton.next_power_of_2(N)
+        BLOCK_SIZE_M = max(1, MIN_BLOCK_SIZE // BLOCK_SIZE_N)
+        _fused_scale_shift_residual_layernorm_1pass_multirow_kernel[
+            (triton.cdiv(M, BLOCK_SIZE_M),)
+        ](
+            x,
+            out,
+            weight,
+            bias,
+            residual,
+            residual_out,
+            scale,
+            shift,
+            x.stride(0),
+            out.stride(0),
+            residual.stride(0) if residual is not None else 0,
+            residual_out.stride(0) if residual_out is not None else 0,
+            scale.stride(0) if scale is not None else 0,
+            shift.stride(0) if shift is not None else 0,
+            M,
+            N,
+            eps,
+            BLOCK_SIZE_M,
+            BLOCK_SIZE_N,
+            is_rms_norm,
+            weight is not None,
+            bias is not None,
+            residual is not None,
+            residual_out is not None,
+            scale is not None,
+            shift is not None,
+        )
+    else:
+        BLOCK_SIZE_N = triton.next_power_of_2(N)
+        _fused_scale_shift_residual_layernorm_1pass_1row_kernel[(M,)](
+            x,
+            out,
+            weight,
+            bias,
+            residual,
+            residual_out,
+            scale,
+            shift,
+            x.stride(0),
+            out.stride(0),
+            residual.stride(0) if residual is not None else 0,
+            residual_out.stride(0) if residual_out is not None else 0,
+            scale.stride(0) if scale is not None else 0,
+            shift.stride(0) if shift is not None else 0,
+            N,
+            eps,
+            BLOCK_SIZE_N,
+            is_rms_norm,
+            weight is not None,
+            bias is not None,
+            residual is not None,
+            residual_out is not None,
+            scale is not None,
+            shift is not None,
+        )
+
+
+def fused_scale_shift_residual_layernorm(
+    x: Tensor,  # [M, N]
+    eps: float = 1e-5,
+    out: Optional[Tensor] = None,  # [M, N]
+    weight: Optional[Tensor] = None,  # [N]
+    bias: Optional[Tensor] = None,  # [N]
+    residual: Optional[Tensor] = None,  # [M, N]
+    residual_out: Optional[Tensor] = None,  # [M, N]
+    scale: Optional[Tensor] = None,  # [1, N] or [M, N]
+    shift: Optional[Tensor] = None,  # [1, N] or [M, N]
+    is_rms_norm: bool = True,
+):
+    if not x.is_contiguous():
+        if (
+            residual is None
+            and scale is None
+            and shift is None
+            and residual_out is None
+            and x.shape[-1] in [64, 128]
+            and x.stride(-1) == 1
+            and x.stride(-2) == x.shape[-1]
+        ):
+            # we assume x is contiguous on N and M
+            x_shape = x.shape
+            M, N = x_shape[-2:]
+            x = x.view(-1, M, N)
+            out = out.view(-1, M, N) if out is not None else torch.empty_like(x)
+            weight = weight.view(-1) if weight is not None else None
+            bias = bias.view(-1) if bias is not None else None
+            assert (
+                M * N * x.element_size() <= 65536
+            ), f"one row should be less than 64KB, got {M * N * x.element_size()=} bytes"
+            assert weight is None or weight.shape == (N,), f"{weight.shape=} != {N=}"
+            assert bias is None or bias.shape == (N,), f"{bias.shape=} != {N=}"
+            _qk_norm_kernel[(x.shape[0],)](
+                x,
+                out,
+                weight,
+                bias,
+                x.stride(0),
+                out.stride(0),
+                M,
+                N,
+                eps,
+                triton.next_power_of_2(M),  # BLOCK_SIZE_M
+                triton.next_power_of_2(N),  # BLOCK_SIZE_N
+                is_rms_norm,
+                weight is not None,
+                bias is not None,
+            )
+            return out.reshape(x_shape)
+        warnings.warn(
+            f"using reshape to force x to be contiguous with {x.shape=} {residual=}, {scale=}, {shift=}, {residual_out=}",
+            stacklevel=2,
+        )
+    x_shape = x.shape
+    x = x.reshape(-1, x_shape[-1])
+    out = out.reshape(-1, x_shape[-1]) if out is not None else torch.empty_like(x)
+    weight = weight.reshape(-1) if weight is not None else None
+    bias = bias.reshape(-1) if bias is not None else None
+    residual = residual.reshape(-1, x_shape[-1]) if residual is not None else None
+    residual_out = (
+        residual_out.reshape(-1, x_shape[-1]) if residual_out is not None else None
+    )
+    scale = scale.reshape(-1, x_shape[-1]) if scale is not None else None
+    shift = shift.reshape(-1, x_shape[-1]) if shift is not None else None
+    if scale is not None and scale.shape[0] == 1:
+        scale = scale.view(-1)
+        # y = (w * norm(x) + b) * scale + shift = w*scale*norm(x) + b*scale + shift
+        weight = weight * scale if weight is not None else scale
+        bias = bias * scale if bias is not None else None
+        scale = None
+    if shift is not None and shift.shape[0] == 1:
+        shift = shift.view(-1)
+        bias = bias + shift if bias is not None else shift
+        shift = None
+    _fused_scale_shift_residual_layernorm(
+        x, out, eps, weight, bias, residual, residual_out, scale, shift, is_rms_norm
+    )
+    return out.reshape(x_shape)
